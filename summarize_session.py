@@ -98,61 +98,135 @@ def extract_conversation(transcript_path: Path) -> list[dict]:
     return turns
 
 
+# ── Auth helper ───────────────────────────────────────────────────────────────
+
+def get_anthropic_client():
+    """
+    Devuelve un cliente Anthropic autenticado.
+    Prioridad:
+      1. ANTHROPIC_API_KEY en el entorno
+      2. OAuth token de ~/.claude/.credentials.json (Claude Code)
+    Retorna None si no hay credenciales disponibles.
+    """
+    import anthropic
+    import time
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key)
+
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    if creds_path.exists():
+        try:
+            creds = json.loads(creds_path.read_text())
+            oauth = creds.get("claudeAiOauth", {})
+            access_token = oauth.get("accessToken", "")
+            expires_at_ms = oauth.get("expiresAt", 0)
+            if access_token and (expires_at_ms == 0 or expires_at_ms > time.time() * 1000):
+                return anthropic.Anthropic(auth_token=access_token)
+        except Exception:
+            pass
+
+    return None
+
+
 # ── Summarizer ────────────────────────────────────────────────────────────────
+
+def summarize_local(turns: list[dict]) -> tuple[str, str]:
+    """
+    Resumen local sin API. Extrae los mensajes del usuario más significativos
+    y las palabras clave más frecuentes como topics.
+    """
+    user_msgs = [t["content"] for t in turns if t["role"] == "user"]
+    # Tomar el primer y último mensaje del usuario como contexto de inicio y fin
+    snippets = []
+    if user_msgs:
+        snippets.append(user_msgs[0][:200])
+    if len(user_msgs) > 1:
+        snippets.append(user_msgs[-1][:200])
+
+    # Topics: palabras de 5+ chars más frecuentes en mensajes del usuario
+    from collections import Counter
+    stopwords = {"sobre", "hacer", "quiero", "tengo", "puedo", "como", "para", "esto", "esta",
+                 "porque", "cuando", "donde", "tiene", "puede", "todos", "había", "ahora"}
+    words = []
+    for msg in user_msgs:
+        words.extend(w.strip(".,?!:;()[]'\"").lower() for w in msg.split() if len(w) > 4)
+    top = [w for w, _ in Counter(words).most_common(15) if w not in stopwords][:6]
+    topics = ", ".join(top)
+
+    assistant_msgs = [t["content"] for t in turns if t["role"] == "assistant"]
+    n_assistant = len(assistant_msgs)
+
+    summary = (
+        f"Sesión con {len(user_msgs)} mensajes del usuario y {n_assistant} respuestas. "
+        f"Inicio: {snippets[0]!r}"
+    )
+    if len(snippets) > 1:
+        summary += f" — Final: {snippets[1]!r}"
+
+    return summary[:500], topics
+
 
 def summarize_with_haiku(turns: list[dict], project: str) -> tuple[str, str]:
     """
     Genera un resumen comprimido de la sesión (~100-150 tokens).
     Retorna (summary, topics_csv).
+    Intenta usar Haiku via ANTHROPIC_API_KEY; si falla, usa resumen local.
+    Nota: el OAuth token de claude.ai no es compatible con api.anthropic.com.
     """
-    import anthropic
-
     if not turns:
         return "", ""
 
-    # Armar texto de conversación truncado
-    convo_lines = []
-    total_chars = 0
-    for t in turns:
-        line = f"{t['role'].upper()}: {t['content'][:400]}"
-        total_chars += len(line)
-        if total_chars > 6000:
-            break
-        convo_lines.append(line)
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return summarize_local(turns)
 
-    convo_text = "\n".join(convo_lines)
-    project_name = Path(project).name
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
 
-    client = anthropic.Anthropic()
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Project: {project_name}\n\n"
-                f"Conversation:\n{convo_text}\n\n"
-                "In 2-3 sentences, summarize: what the user was trying to do, "
-                "what was accomplished, and any key decisions or problems found. "
-                "Then on a new line starting with 'TOPICS:', list 3-5 key topics as comma-separated words."
-            ),
-        }],
-    )
+        convo_lines = []
+        total_chars = 0
+        for t in turns:
+            line = f"{t['role'].upper()}: {t['content'][:400]}"
+            total_chars += len(line)
+            if total_chars > 6000:
+                break
+            convo_lines.append(line)
 
-    text = resp.content[0].text.strip()
-    summary, topics = text, ""
-
-    if "TOPICS:" in text:
-        parts = text.split("TOPICS:", 1)
-        summary = parts[0].strip()
-        topics  = parts[1].strip()
-
-    return summary, topics
+        project_name = Path(project).name
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Project: {project_name}\n\n"
+                    f"Conversation:\n{chr(10).join(convo_lines)}\n\n"
+                    "In 2-3 sentences, summarize: what the user was trying to do, "
+                    "what was accomplished, and any key decisions or problems found. "
+                    "Then on a new line starting with 'TOPICS:', list 3-5 key topics as comma-separated words."
+                ),
+            }],
+        )
+        text = resp.content[0].text.strip()
+        summary, topics = text, ""
+        if "TOPICS:" in text:
+            parts = text.split("TOPICS:", 1)
+            summary = parts[0].strip()
+            topics  = parts[1].strip()
+        return summary, topics
+    except Exception:
+        return summarize_local(turns)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Garantizar que la tabla existe siempre, independientemente del flujo posterior
+    get_db().close()
+
     raw = sys.stdin.read()
     try:
         data = json.loads(raw)
