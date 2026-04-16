@@ -98,38 +98,6 @@ def extract_conversation(transcript_path: Path) -> list[dict]:
     return turns
 
 
-# ── Auth helper ───────────────────────────────────────────────────────────────
-
-def get_anthropic_client():
-    """
-    Devuelve un cliente Anthropic autenticado.
-    Prioridad:
-      1. ANTHROPIC_API_KEY en el entorno
-      2. OAuth token de ~/.claude/.credentials.json (Claude Code)
-    Retorna None si no hay credenciales disponibles.
-    """
-    import anthropic
-    import time
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
-        return anthropic.Anthropic(api_key=api_key)
-
-    creds_path = Path.home() / ".claude" / ".credentials.json"
-    if creds_path.exists():
-        try:
-            creds = json.loads(creds_path.read_text())
-            oauth = creds.get("claudeAiOauth", {})
-            access_token = oauth.get("accessToken", "")
-            expires_at_ms = oauth.get("expiresAt", 0)
-            if access_token and (expires_at_ms == 0 or expires_at_ms > time.time() * 1000):
-                return anthropic.Anthropic(auth_token=access_token)
-        except Exception:
-            pass
-
-    return None
-
-
 # ── Summarizer ────────────────────────────────────────────────────────────────
 
 def summarize_local(turns: list[dict]) -> tuple[str, str]:
@@ -168,57 +136,119 @@ def summarize_local(turns: list[dict]) -> tuple[str, str]:
     return summary[:500], topics
 
 
+def summarize_with_claude_cli(turns: list[dict], project: str) -> tuple[str, str]:
+    """
+    Genera un resumen usando `claude -p` (Claude Code CLI), que usa la auth
+    existente sin necesitar ANTHROPIC_API_KEY por separado.
+    Retorna (summary, topics_csv) o ("", "") si falla.
+    """
+    import subprocess
+    import shutil
+
+    if not shutil.which("claude"):
+        return "", ""
+
+    convo_lines = []
+    total_chars = 0
+    for t in turns:
+        line = f"{t['role'].upper()}: {t['content'][:400]}"
+        total_chars += len(line)
+        if total_chars > 6000:
+            break
+        convo_lines.append(line)
+
+    project_name = Path(project).name
+    prompt = (
+        f"Project: {project_name}\n\n"
+        f"Conversation:\n{chr(10).join(convo_lines)}\n\n"
+        "In 2-3 sentences, summarize: what the user was trying to do, "
+        "what was accomplished, and any key decisions or problems found. "
+        "Then on a new line starting with 'TOPICS:', list 3-5 key topics as comma-separated words. "
+        "Reply with the summary and topics only, no preamble."
+    )
+
+    result = subprocess.run(
+        ["claude", "-p", "--model", "haiku", "--no-session-persistence"],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return "", ""
+
+    text = result.stdout.strip()
+    summary, topics = text, ""
+    if "TOPICS:" in text:
+        parts = text.split("TOPICS:", 1)
+        summary = parts[0].strip()
+        topics  = parts[1].strip()
+    return summary, topics
+
+
 def summarize_with_haiku(turns: list[dict], project: str) -> tuple[str, str]:
     """
     Genera un resumen comprimido de la sesión (~100-150 tokens).
-    Retorna (summary, topics_csv).
-    Intenta usar Haiku via ANTHROPIC_API_KEY; si falla, usa resumen local.
-    Nota: el OAuth token de claude.ai no es compatible con api.anthropic.com.
+    Prioridad:
+      1. claude CLI (-p) — usa la auth de Claude Code sin config extra
+      2. ANTHROPIC_API_KEY — SDK directo
+      3. summarize_local — fallback sin API
     """
     if not turns:
         return "", ""
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return summarize_local(turns)
-
+    # 1. Intentar con claude CLI
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-
-        convo_lines = []
-        total_chars = 0
-        for t in turns:
-            line = f"{t['role'].upper()}: {t['content'][:400]}"
-            total_chars += len(line)
-            if total_chars > 6000:
-                break
-            convo_lines.append(line)
-
-        project_name = Path(project).name
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Project: {project_name}\n\n"
-                    f"Conversation:\n{chr(10).join(convo_lines)}\n\n"
-                    "In 2-3 sentences, summarize: what the user was trying to do, "
-                    "what was accomplished, and any key decisions or problems found. "
-                    "Then on a new line starting with 'TOPICS:', list 3-5 key topics as comma-separated words."
-                ),
-            }],
-        )
-        text = resp.content[0].text.strip()
-        summary, topics = text, ""
-        if "TOPICS:" in text:
-            parts = text.split("TOPICS:", 1)
-            summary = parts[0].strip()
-            topics  = parts[1].strip()
-        return summary, topics
+        summary, topics = summarize_with_claude_cli(turns, project)
+        if summary:
+            return summary, topics
     except Exception:
-        return summarize_local(turns)
+        pass
+
+    # 2. Intentar con ANTHROPIC_API_KEY
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+
+            convo_lines = []
+            total_chars = 0
+            for t in turns:
+                line = f"{t['role'].upper()}: {t['content'][:400]}"
+                total_chars += len(line)
+                if total_chars > 6000:
+                    break
+                convo_lines.append(line)
+
+            project_name = Path(project).name
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Project: {project_name}\n\n"
+                        f"Conversation:\n{chr(10).join(convo_lines)}\n\n"
+                        "In 2-3 sentences, summarize: what the user was trying to do, "
+                        "what was accomplished, and any key decisions or problems found. "
+                        "Then on a new line starting with 'TOPICS:', list 3-5 key topics as comma-separated words."
+                    ),
+                }],
+            )
+            text = resp.content[0].text.strip()
+            summary, topics = text, ""
+            if "TOPICS:" in text:
+                parts = text.split("TOPICS:", 1)
+                summary = parts[0].strip()
+                topics  = parts[1].strip()
+            return summary, topics
+        except Exception:
+            pass
+
+    # 3. Fallback local
+    return summarize_local(turns)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
