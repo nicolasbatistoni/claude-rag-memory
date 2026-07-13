@@ -2,13 +2,32 @@
 variables:
   - &toolkit ghcr.io/nicolasbatistoni/cicd-toolkit:latest
 
+  # ── Allowlist del disparo (AGENTS §1.ter) ─────────────────────────────────────────────────────────
+  # Un pipeline corre si y solo si el commit tocó código de este paquete, código de una dependencia que
+  # consume, o la definición de su propio pipeline. Un typo en el CHANGELOG no levanta un pod.
+  # `cicd paths-guard` (en el step `security`, el único sin filtro) verifica que esta lista sea TOTAL:
+  # si aparece código nuevo sin su filtro, ROMPE el CI en vez de saltearse el gate en silencio.
+  - &code_paths
+    include:
+      - '*.py'                  # código propio: los .py sueltos de la raíz son TODO el paquete
+                                # (server MCP, core RAG, hooks de sesión, búsqueda, resumen)
+      - 'requirements.txt'      # deps externas (chromadb, sentence-transformers, torch, mcp…)
+      - 'install.sh'            # el instalador ES el entregable: arma el venv, instala las deps y
+                                # registra el MCP + los hooks en ~/.claude — si cambia, hay que validarlo
+      - 'cicd.yml'              # su propia definición de pipeline: sin esto, cambiarla no la re-corre
+      - '.woodpecker.yml'
+      - 'AGENTS.md'             # va adrede aunque sea un doc: `cicd ci` corre step_docs_guard, que
+                                # gatea su tamaño (§3.quater) — si nada lo dispara, no corre nunca.
+
 when:
   - event: [pull_request, push]
 
 steps:
-  security:
-    image: *toolkit
-    commands: [cicd security]
+  security:                           # SIN when:path → corre SIEMPRE. Única excepción, deliberada:
+    image: *toolkit                   # Trivy caza un secreto commiteado hasta en un README, y el
+    commands:                         # paths-guard tiene que correr aunque el commit no toque código.
+      - cicd security
+      - cicd paths-guard
 
   release:
     image: *toolkit
@@ -16,5 +35,6 @@ steps:
     when:
       - event: push
         branch: main
+        path: *code_paths
     environment:
       GH_TOKEN: { from_secret: gh_token }
